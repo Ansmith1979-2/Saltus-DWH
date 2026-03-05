@@ -1,0 +1,1238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Saltus: Azure Data Warehouse Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Montserrat', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: #071523;
+      color: #dce8f5;
+    }
+    #root { height: 100vh; display: flex; flex-direction: column; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(0,120,212,0.35); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: rgba(0,120,212,0.6); }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── Azure + Saltus brand tokens ───────────────────────────────────────────────
+const B = {
+  azBlue:   '#0078d4',   // Azure primary
+  azCyan:   '#50e6ff',   // Azure light cyan
+  azPurple: '#8661c5',   // Synapse
+  azGreen:  '#107c10',   // Azure green
+  azOrange: '#e87722',   // ADF orange
+  azFn:     '#f2c811',   // Functions yellow
+  saltus:   '#18263a',   // Saltus navy
+  bg:       '#071523',
+  panel:    '#0d1e30',
+  border:   'rgba(0,120,212,0.2)',
+  text:     '#dce8f5',
+  dim:      'rgba(220,232,245,0.4)',
+};
+
+// ── Medallion layer colours (industry convention) ─────────────────────────────
+const LC = {
+  source:   '#3b82f6',
+  bronze:   '#f59e0b',
+  silver:   '#94a3b8',
+  gold:     '#eab308',
+  datamart: '#8b5cf6',
+  consumer: '#22c55e',
+};
+
+// ── Logos (source systems) ────────────────────────────────────────────────────
+const LOGOS = {
+  saltus:  'https://cdn.brandfetch.io/id90Y2qCi7/w/400/h/400/theme/dark/icon.jpeg?c=1bxid64Mup7aczewSAYMX&t=1766929982286',
+  curo:    null,   // No standalone Curo logo available; curocrm.co.uk unreachable
+  mabel:   'https://cdn.brandfetch.io/idFEQLSBvF/w/160/h/160/theme/dark/logo.png?c=1bxid64Mup7aczewSAYMX',
+  hubwise: 'https://www.hubwiseconnect.co.uk/hs-fs/hubfs/logos/hubwise_connect_logo_430x100.png',
+};
+
+// ── Azure service metadata + official icon paths ──────────────────────────────
+const AZ_SERVICES = {
+  adls:      { name: 'ADLS Gen2',               abbr: 'ADLS Gen2',                   color: '#0078d4', icon: 'MS logos/adls-gen2.svg'     },
+  adf:       { name: 'Azure Data Factory',      abbr: 'ADF Pipeline',                color: '#e87722', icon: 'MS logos/data-factory.svg'   },
+  fn:        { name: 'Azure Functions',         abbr: 'Event Trigger',               color: '#f2c811', icon: 'MS logos/functions.svg'      },
+  synapse:    { name: 'Azure Synapse Analytics', abbr: 'Spark / SQL Pool',            color: '#0078d4', icon: 'MS logos/synapse.svg'        },
+  synapsesql: { name: 'Azure Synapse Analytics', abbr: 'SQL Pool',                   color: '#0078d4', icon: 'MS logos/synapse.svg'        },
+  pbi:       { name: 'Microsoft Power BI',      abbr: 'Power BI Service',            color: '#e6ad10', icon: 'MS logos/power-bi.svg'       },
+  apim:      { name: 'Azure API Management',    abbr: 'REST API',                    color: '#32d4f5', icon: 'MS logos/api-management.svg' },
+  sql:       { name: 'Azure SQL Database',      abbr: 'SQL Database',                color: '#0078d4', icon: 'MS logos/sql-database.svg'   },
+  logicapps: { name: 'Azure Logic Apps',        abbr: 'Logic Apps',                  color: '#7a439a', icon: 'MS logos/logic-apps.svg'     },
+};
+
+// Renders the official Microsoft SVG icon at the requested size
+function AzureIcon({ type, size = 18 }) {
+  const svc = AZ_SERVICES[type];
+  if (!svc) return null;
+  return <img src={svc.icon} width={size} height={size} style={{objectFit:'contain', display:'block'}} alt={svc.name}/>;
+}
+
+// ── AzBadge: small Azure service chip for node cards ─────────────────────────
+function AzBadge({ type, inline = false }) {
+  const svc = AZ_SERVICES[type];
+  if (!svc) return null;
+  return (
+    <div style={{
+      display: 'inline-flex', alignItems: 'center', gap: 4,
+      background: `${svc.color}18`,
+      border: `1px solid ${svc.color}55`,
+      borderRadius: 4, padding: inline ? '2px 6px' : '3px 7px',
+      marginTop: inline ? 0 : 6,
+    }}>
+      <AzureIcon type={type} size={inline ? 12 : 13}/>
+      <span style={{
+        fontSize: inline ? 9 : 9.5, fontWeight: 600, color: svc.color,
+        textTransform: 'uppercase', letterSpacing: 0.6, whiteSpace: 'nowrap',
+        fontFamily: "'Montserrat', sans-serif",
+      }}>{svc.abbr}</span>
+    </div>
+  );
+}
+
+// ── Node definitions ───────────────────────────────────────────────────────────
+const NODES = {
+  curo: {
+    id:'curo', label:'CURO', sub:'CRM', icon:'👥', layer:'source', logo:'curo',
+    azSvc: null,
+    desc:'Primary CRM system and system of record for all client relationships, account structures, adviser assignments and fee data.',
+    attrs:['client_id','name','risk_profile','business_unit','adviser_id','account_id','plan_type','fee_basis','review_date'],
+    integration:'Daily SQL snapshot via the Curo BI database. Azure Data Factory SQL connector pulls a full extract nightly at 22:00 and lands it into ADLS Gen2.',
+    freq:'Daily (22:00 UTC)', vol:'~15k clients · ~40k accounts',
+    eg:`{
+  "client_id": "C12345",
+  "name": "Adrian Smith",
+  "risk_profile": "Balanced",
+  "business_unit": "RB",
+  "adviser_id": "A789",
+  "account_id": "ACC001",
+  "plan_type": "ISA"
+}`,
+  },
+  mabel: {
+    id:'mabel', label:'MABEL', sub:'Portfolio', icon:'📈', layer:'source', logo:'mabel',
+    azSvc: null,
+    desc:'Portfolio management system providing daily valuations, holdings, transactions and cash balances for all client accounts.',
+    attrs:['account_number','market_value','cash','invested','holdings','transactions','valuation_date'],
+    integration:'Daily CSV/XLS files delivered via SFTP. Azure Data Factory SFTP connector picks up files and loads them to ADLS Gen2 by 08:00. Original files retained in a separate container for FCA audit.',
+    freq:'Daily (by 08:00 UTC)', vol:'~40k accounts · ~500k holding rows/day',
+    eg:`{
+  "account_number": "MB123456",
+  "valuation_date": "2024-01-15",
+  "market_value": 250000.00,
+  "cash": 5000.00,
+  "invested": 245000.00,
+  "holdings_count": 12
+}`,
+  },
+  hubwise: {
+    id:'hubwise', label:'HUBWISE', sub:'Workflow', icon:'⚡', layer:'source', logo:'hubwise',
+    azSvc: null,
+    desc:'Workflow and activity management system tracking adviser activities, annual reviews and document management. Currently proxied via OneView.',
+    attrs:['activity_id','activity_type','adviser_id','client_id','duration','status','documents'],
+    integration:'EOD files via OneView as proxy, landed into ADLS Gen2 via Azure Data Factory. Transition to direct HubWise REST API connector is planned.',
+    freq:'End of Day', vol:'~500 activities/day',
+    eg:`{
+  "activity_id": "ACT98765",
+  "activity_type": "Annual Review",
+  "adviser": "A789",
+  "client_id": "C12345",
+  "duration": 90,
+  "status": "Completed",
+  "date": "2024-01-15"
+}`,
+  },
+  bw: {
+    id:'bw', label:'BW', sub:'Pensions', icon:'🏦', layer:'source',
+    azSvc: null,
+    desc:'Pension administration system providing SIPP crystallisation data and pension splits for regulatory reporting.',
+    attrs:['sipp_id','total','crystallised','uncrystallised','drawdown_amount','crystallisation_date'],
+    integration:'Daily CSV files uploaded directly to ADLS Gen2. An Azure Functions timer trigger fires on blob arrival to notify downstream Azure Data Factory pipelines.',
+    freq:'Daily (morning)', vol:'~8k SIPP accounts',
+    eg:`{
+  "sipp_id": "SIPP001",
+  "client_id": "C12345",
+  "total": 250000.00,
+  "crystallised": 150000.00,
+  "uncrystallised": 100000.00,
+  "drawdown": 12000.00
+}`,
+  },
+
+  bronze_curo: {
+    id:'bronze_curo', label:'Bronze CURO', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'adls',
+    desc:'Landing zone in ADLS Gen2 for Curo BI database snapshot. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
+    integration:'ADF scheduled pipeline extracts database snapshot, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Data Factory, ADLS Gen2',
+    triggerType:'Scheduled (not batch - event-driven after schedule triggers)',
+    eg:`{
+  "_ingestion_date": "2024-01-15",
+  "_source": "curo_bi",
+  "_row_hash": "a3f8b2c1...",
+  "_vr_status": "PASSED",
+  "client_id": "C12345",
+  "client_name": "Adrian Smith",
+  "risk_profile": "Balanced"
+}`,
+  },
+  bronze_mabel: {
+    id:'bronze_mabel', label:'Bronze MABEL', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'adls',
+    desc:'Landing zone in ADLS Gen2 for Mabel portfolio files. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
+    integration:'Files received via SFTP to ADLS Gen2, Azure Function Blob Trigger detects arrival, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions, Data Factory, ADLS Gen2',
+    triggerType:'Event-driven (Blob Trigger on file arrival)',
+    eg:`{
+  "_ingestion_date": "2024-01-15",
+  "_source": "mabel",
+  "_row_hash": "b7e9c4d2...",
+  "_vr_status": "PASSED",
+  "account_number": "MB123456",
+  "market_value": 250000,
+  "cash_balance": 5000
+}`,
+  },
+  bronze_hubwise: {
+    id:'bronze_hubwise', label:'Bronze HUBWISE', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'adls',
+    desc:'Landing zone in ADLS Gen2 for HubWise activity data. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
+    integration:'EOD files land in ADLS Gen2, Azure Function Blob Trigger detects arrival, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions, Data Factory, ADLS Gen2',
+    triggerType:'Event-driven (Blob Trigger on file arrival)',
+    eg:`{
+  "_ingestion_date": "2024-01-15",
+  "_source": "hubwise",
+  "_row_hash": "c8f1a5e3...",
+  "_vr_status": "PASSED",
+  "activity_type": "Annual Review",
+  "adviser_id": "A789",
+  "duration_minutes": 90
+}`,
+  },
+  bronze_bw: {
+    id:'bronze_bw', label:'Bronze BW', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'fn',
+    desc:'Landing zone in ADLS Gen2 for BW pension data. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
+    integration:'CSV files land in ADLS Gen2, Azure Function Blob Trigger detects arrival, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions, Data Factory, ADLS Gen2',
+    triggerType:'Event-driven (Blob Trigger on file arrival)',
+    eg:`{
+  "_ingestion_date": "2024-01-15",
+  "_source": "bw_pensions",
+  "_row_hash": "d9a2b6f4...",
+  "_vr_status": "PASSED",
+  "account_number": "MB789012",
+  "total_value": 250000,
+  "crystallised": 150000,
+  "uncrystallised": 100000
+}`,
+  },
+
+  bronze_vr: {
+    id:'bronze_vr', label:'Validation & Reconciliation', sub:'Bronze Component', icon:'🔍', layer:'bronze', azSvc:'fn', azSvcs:['fn','sql','logicapps'],
+    desc:'Data quality validation and reconciliation engine for all Bronze sources. All data stored regardless of quality findings. DQ metadata logged with automated alerts. Feedback loops enable human review and rule refinement.',
+    capabilities:[
+      'Volume validation (expected vs actual record counts)',
+      'Schema validation (detect column changes)',
+      'Data type validation (dates, numbers, nulls)',
+      'Range checks (dates within acceptable range)',
+      'Cross-source reconciliation (Curo vs Mabel record counts)',
+      'DQ metadata logging (all findings tracked)',
+      'Automated alerts (critical/warning/info severity levels)',
+      'Feedback loops (human review, rule updates, reprocessing)',
+    ],
+    outputs:[
+      'DQ metadata table (SQL database with findings)',
+      'Alert notifications (Teams/Email based on severity)',
+      'Validation reports (daily/weekly summaries)',
+    ],
+    attrs:['source_system','file_date','check_type','check_name','expected_value','actual_value','severity','alert_sent'],
+    integration:'Azure Functions (DQ checks), Azure SQL (metadata storage), Logic Apps (alerts)',
+    eg:`{
+  "source_system": "curo",
+  "file_date": "2024-01-15",
+  "check_type": "volume",
+  "check_name": "record_count",
+  "expected_value": "100000",
+  "actual_value": "10000",
+  "severity": "CRITICAL",
+  "alert_sent": true
+}`,
+  },
+
+  client_master: {
+    id:'client_master', label:'Client Master', sub:'Silver', icon:'👤', layer:'silver', azSvc:'synapsesql',
+    desc:'Client master from Curo with deduplication and standardisation. Duplicate client records merged using deterministic matching rules (email + name + postcode). Name formats standardised (title case, spaces trimmed). Risk profile values mapped to canonical FCA categories.',
+    attrs:['client_id','full_name','risk_profile (standardised)','business_unit','adviser_id','client_since','status','_dedup_source_count'],
+    integration:'ADF triggers Synapse SQL stored procedure to process Bronze Curo data. Deduplication applied using email, name, and postcode matching. Name standardisation (title case, trim whitespace). Risk profile variants mapped to canonical values. Output written to Silver container as Parquet.\n\nAzure Services: Data Factory, Synapse Analytics (SQL Pool)',
+    triggerType:'Event-driven (triggered after Bronze Curo validation completes)',
+    eg:`{
+  "client_id": "C12345",
+  "full_name": "Adrian Smith",
+  "risk_profile": "BALANCED",
+  "business_unit": "RB",
+  "adviser_id": "A789",
+  "client_since": "2018-04-01",
+  "status": "ACTIVE",
+  "_dedup_source_count": 1
+}`,
+  },
+  account_master: {
+    id:'account_master', label:'Account Master', sub:'Silver', icon:'📋', layer:'silver', azSvc:'synapsesql',
+    desc:'Account master combining Curo plan structure with Mabel custody data. Left outer join on custodian_account_number. Orphan accounts identified (exists in Curo but not Mabel, or vice versa) and flagged for investigation. Match confidence scored based on join quality.',
+    attrs:['account_id','curo_plan_id','mabel_account_number','client_id','plan_type','status','custodian_number','match_confidence','orphan_flag','orphan_type'],
+    integration:'ADF triggers Synapse SQL stored procedure to join Bronze Curo plans with Bronze Mabel accounts on custodian_account_number. Orphan records (null on either side of join) flagged with orphan_type (CURO_ONLY or MABEL_ONLY). Orphans logged to DQ metadata table for reconciliation. Output written to Silver container as Parquet.\n\nAzure Services: Data Factory, Synapse Analytics (SQL Pool), Azure SQL (orphan logging)',
+    triggerType:'Event-driven (triggered after both Bronze Curo and Bronze Mabel validation complete)',
+    eg:`{
+  "account_id": "ACC001",
+  "curo_plan_id": "CURO_ACC001",
+  "mabel_account_number": "MB123456",
+  "client_id": "C12345",
+  "plan_type": "ISA",
+  "status": "ACTIVE",
+  "custodian_number": "CUST99",
+  "match_confidence": "HIGH",
+  "orphan_flag": false,
+  "orphan_type": null
+}`,
+  },
+  balance_data: {
+    id:'balance_data', label:'Balance Data', sub:'Silver', icon:'💰', layer:'silver', azSvc:'synapsesql',
+    desc:'Daily account balances combining Mabel portfolio values with BW pension crystallisation splits. All accounts from Mabel included. SIPP accounts enriched with BW crystallisation data (crystallised/uncrystallised amounts). Percentage crystallised calculated for SIPP accounts.',
+    attrs:['account_id','valuation_date','market_value','cash_balance','invested_balance','crystallised (SIPP only)','uncrystallised (SIPP only)','pct_crystallised (calculated)','source_system'],
+    integration:'ADF triggers Synapse SQL stored procedure to join Bronze Mabel (all accounts) with Bronze BW (SIPP accounts only) on account_number and valuation_date. Crystallisation percentage calculated (crystallised / total_value * 100). Output written to Silver container as Parquet.\n\nAzure Services: Data Factory, Synapse Analytics (SQL Pool)',
+    triggerType:'Event-driven (triggered after Bronze Mabel and Bronze BW validation complete)',
+    eg:`{
+  "account_id": "ACC001",
+  "valuation_date": "2024-01-15",
+  "market_value": 250000.00,
+  "cash_balance": 5000.00,
+  "invested_balance": 245000.00,
+  "crystallised": 150000.00,
+  "uncrystallised": 100000.00,
+  "pct_crystallised": 60.00,
+  "source_system": "MABEL+BW"
+}`,
+  },
+  activity_data: {
+    id:'activity_data', label:'Activity Data', sub:'Silver', icon:'📅', layer:'silver', azSvc:'synapsesql',
+    desc:'HubWise activity data with referential integrity validation and standardisation. Adviser IDs validated against Curo adviser master. Client IDs validated against Curo client master. Invalid references flagged for investigation. Activity type values standardised to canonical list (e.g., "annual review", "Annual Review" mapped to "ANNUAL_REVIEW").',
+    attrs:['activity_id','activity_type (standardised)','adviser_id','client_id','duration_mins','completed_date','outcome','ref_integrity_flag','invalid_reference_type'],
+    integration:'ADF triggers Synapse SQL stored procedure to process Bronze HubWise data. Validates adviser_id exists in Bronze Curo advisers table. Validates client_id exists in Bronze Curo clients table. Invalid references flagged with invalid_reference_type (INVALID_ADVISER or INVALID_CLIENT) and logged to DQ metadata table. Activity type variants mapped to canonical values. Output written to Silver container as Parquet.\n\nAzure Services: Data Factory, Synapse Analytics (SQL Pool), Azure SQL (invalid reference logging)',
+    triggerType:'Event-driven (triggered after Bronze HubWise validation completes)',
+    eg:`{
+  "activity_id": "ACT98765",
+  "activity_type": "ANNUAL_REVIEW",
+  "adviser_id": "A789",
+  "client_id": "C12345",
+  "duration_mins": 90,
+  "completed_date": "2024-01-15",
+  "outcome": "Completed",
+  "ref_integrity_flag": "PASSED",
+  "invalid_reference_type": null
+}`,
+  },
+
+  client_dim: {
+    id:'client_dim', label:'Client Dim', sub:'SCD Type 2', icon:'👥', layer:'gold', azSvc:'synapsesql',
+    desc:'Client dimension with full change history via SCD Type 2. Tracks changes to risk profile, adviser assignment, and business unit over time. One surrogate key per version. Current version flagged with is_current.',
+    attrs:['client_key (surrogate)','client_id (business key)','full_name','risk_profile','business_unit','adviser_key','valid_from','valid_to','is_current'],
+    integration:'ADF pipeline runs SCD Type 2 merge into Synapse Dedicated SQL Pool. New rows inserted on any attribute change (risk profile, adviser, business unit). Previous version marked is_current = 0, valid_to updated. Surrogate key generated by Synapse IDENTITY column. REPLICATE distribution for dimension table.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[{title:'Distribution',text:'REPLICATE (small dimension table, copied to all compute nodes)'}],
+    eg:`{
+  "client_key": 10001,
+  "client_id": "C12345",
+  "full_name": "Adrian Smith",
+  "risk_profile": "BALANCED",
+  "business_unit": "RB",
+  "adviser_key": 30001,
+  "valid_from": "2023-06-01",
+  "valid_to": "9999-12-31",
+  "is_current": true
+}`,
+  },
+  account_dim: {
+    id:'account_dim', label:'Account Dim', sub:'SCD Type 2', icon:'📁', layer:'gold', azSvc:'synapsesql',
+    desc:'Account dimension tracking plan type changes, status transitions, and custodian assignments via SCD Type 2. Full history maintained for regulatory audit requirements.',
+    attrs:['account_key (surrogate)','account_id (business key)','client_key','plan_type','status','custodian_number','valid_from','valid_to','is_current'],
+    integration:'ADF SCD Type 2 merge into Synapse Dedicated SQL Pool. New version created on plan type change, status transition, or custodian reassignment. REPLICATE distribution for dimension table.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[{title:'Distribution',text:'REPLICATE (small dimension table, copied to all compute nodes)'}],
+    eg:`{
+  "account_key": 20001,
+  "account_id": "ACC001",
+  "plan_type": "ISA",
+  "status": "ACTIVE",
+  "custodian_number": "CUST99",
+  "valid_from": "2022-04-06",
+  "valid_to": "9999-12-31",
+  "is_current": true
+}`,
+  },
+  adviser_dim: {
+    id:'adviser_dim', label:'Adviser Dim', sub:'SCD Type 2', icon:'🧑‍💼', layer:'gold', azSvc:'synapsesql',
+    desc:'Adviser dimension built from Curo adviser master. Tracks business unit moves and role changes via SCD Type 2. Type 1 approach for name changes (overwrite).',
+    attrs:['adviser_key (surrogate)','adviser_id (business key)','full_name','business_unit','qualification_level','valid_from','valid_to','is_current'],
+    integration:'ADF pipeline merges Silver Client Master adviser references with Curo adviser master table. SCD Type 2 applied for business unit and qualification changes. Loaded into Synapse Dedicated SQL Pool. REPLICATE distribution for dimension table.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[{title:'Distribution',text:'REPLICATE (small dimension table, copied to all compute nodes)'}],
+    eg:`{
+  "adviser_key": 30001,
+  "adviser_id": "A789",
+  "full_name": "James Wilson",
+  "business_unit": "RB",
+  "qualification_level": "Level 4",
+  "valid_from": "2022-01-01",
+  "is_current": true
+}`,
+  },
+  time_dim: {
+    id:'time_dim', label:'Time Dim', sub:'Date Spine', icon:'📅', layer:'gold', azSvc:'synapsesql',
+    desc:'Date spine covering 2010 to 2035. Business day flags, FCA reporting periods, and UK public holiday markers included. Static reference table replicated across all Synapse compute nodes for optimal join performance.',
+    attrs:['date_key (surrogate)','date','day_of_week','week','month','quarter','year','is_business_day','is_month_end','fca_period','uk_bank_holiday_flag'],
+    integration:'Static table loaded once via COPY INTO from ADLS Gen2 CSV file. REPLICATE distribution ensures every compute node has full copy. Refreshed annually to extend forward dates.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[{title:'Distribution',text:'REPLICATE (small static table, copied to all compute nodes for fast joins)'}],
+    eg:`{
+  "date_key": 20240115,
+  "date": "2024-01-15",
+  "day_of_week": "Monday",
+  "quarter": "Q1",
+  "year": 2024,
+  "is_business_day": true,
+  "is_month_end": false,
+  "uk_bank_holiday_flag": false
+}`,
+  },
+  balance_fact: {
+    id:'balance_fact', label:'Balance Fact', sub:'Daily per account', icon:'💹', layer:'gold', azSvc:'synapsesql',
+    desc:'Core financial fact table storing daily AUM snapshot per account. Atomic grain: one row per account per date. HASH-distributed on account_key for parallel query performance. Includes DQ flags from Validation & Reconciliation engine. Columnstore index for analytics workloads.',
+    attrs:['balance_key (surrogate)','account_key','client_key','date_key','market_value','cash_balance','invested_balance','crystallised (SIPP only)','uncrystallised (SIPP only)','dq_flag','dq_severity'],
+    integration:'ADF incremental load via COPY INTO from ADLS Gen2 Parquet (Silver Balance Data). Staged in Synapse external tables, then INSERT into Dedicated SQL Pool fact table. Columnstore clustered index applied. HASH distribution on account_key spreads data evenly across 60 compute nodes.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool), ADLS Gen2',
+    details:[
+      {title:'Grain',text:'One row per account per date (daily snapshot)'},
+      {title:'Distribution',text:'HASH (account_key) - distributes rows evenly across compute nodes for large fact table'},
+      {title:'Volume',text:'Approximately 9 million rows per year (25k accounts x 365 days)'},
+    ],
+    eg:`{
+  "balance_key": 987654,
+  "account_key": 20001,
+  "client_key": 10001,
+  "date_key": 20240115,
+  "market_value": 250000.00,
+  "cash_balance": 5000.00,
+  "crystallised": 150000.00,
+  "uncrystallised": 100000.00,
+  "dq_flag": "PASSED",
+  "dq_severity": null
+}`,
+  },
+  activity_fact: {
+    id:'activity_fact', label:'Activity Fact', sub:'Per event', icon:'📊', layer:'gold', azSvc:'synapsesql',
+    desc:'Adviser activity fact table for productivity tracking and FCA activity logging. Atomic grain: one row per activity event. HASH-distributed on adviser_key. Includes activity type, duration, outcome, and DQ flags.',
+    attrs:['activity_key (surrogate)','client_key','adviser_key','date_key','activity_type','duration_mins','outcome','dq_flag'],
+    integration:'ADF daily load via COPY INTO from ADLS Gen2 Parquet (Silver Activity Data). Deduplication on activity_id natural key in staging table before INSERT into Dedicated SQL Pool. Columnstore clustered index applied. HASH distribution on adviser_key.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool), ADLS Gen2',
+    details:[
+      {title:'Grain',text:'One row per activity event'},
+      {title:'Distribution',text:'HASH (adviser_key) - distributes rows evenly across compute nodes'},
+      {title:'Volume',text:'Approximately 365k rows per year (1000 activities per day)'},
+    ],
+    eg:`{
+  "activity_key": 50001,
+  "client_key": 10001,
+  "adviser_key": 30001,
+  "date_key": 20240115,
+  "activity_type": "ANNUAL_REVIEW",
+  "duration_mins": 90,
+  "outcome": "Completed",
+  "dq_flag": "PASSED"
+}`,
+  },
+
+  // ── Data Marts ────────────────────────────────────────────────────────────────────────────────
+  aum_mart: {
+    id:'aum_mart', label:'AUM Data Mart', sub:'Daily Aggregates', icon:'💰', layer:'datamart', azSvc:'synapsesql',
+    desc:'Pre-aggregated AUM metrics for business unit and adviser reporting. Daily AUM totals by business unit, adviser, client segment, and plan type. Optimised for Power BI DirectQuery performance. REPLICATE distribution for fast queries.',
+    attrs:['date_key','business_unit','adviser_id','client_segment','plan_type','total_aum','client_count','avg_account_size','cash_pct','crystallised_pct'],
+    integration:'ADF triggers Synapse SQL stored procedure to aggregate Balance Fact daily. Groups by business unit, adviser, client segment, plan type. Results written to Synapse SQL table with columnstore index. REPLICATE distribution ensures fast Power BI queries.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[
+      {title:'Grain',text:'One row per date per business unit per adviser'},
+      {title:'Distribution',text:'REPLICATE (pre-aggregated, small result set - copied to all compute nodes for fast queries)'},
+      {title:'Measures',items:['Total AUM (sum of market values)','Client count (distinct accounts)','Average account size','Cash percentage','Crystallised percentage (SIPPs only)']},
+    ],
+    eg:`{
+  "date_key": 20240115,
+  "business_unit": "RB",
+  "adviser_id": "A789",
+  "plan_type": "ISA",
+  "total_aum": 45000000,
+  "client_count": 180,
+  "avg_account_size": 250000,
+  "cash_pct": 2.0,
+  "crystallised_pct": 60.0
+}`,
+  },
+  activity_mart: {
+    id:'activity_mart', label:'Activity Data Mart', sub:'Monthly Aggregates', icon:'📅', layer:'datamart', azSvc:'synapsesql',
+    desc:'Pre-aggregated adviser productivity metrics. Monthly activity counts, average durations, and completion rates by adviser and activity type. Supports ABI/WABI productivity dashboards.',
+    attrs:['month_key','adviser_id','activity_type','activity_count','avg_duration_mins','completion_rate','distinct_clients'],
+    integration:'ADF triggers Synapse SQL stored procedure to aggregate Activity Fact monthly. Groups by adviser, activity type. Results written to Synapse SQL table with columnstore index. REPLICATE distribution.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[
+      {title:'Grain',text:'One row per month per adviser per activity type'},
+      {title:'Distribution',text:'REPLICATE (pre-aggregated, small result set - copied to all compute nodes)'},
+      {title:'Measures',items:['Activity count','Average duration (minutes)','Completion rate (percentage)','Distinct clients engaged']},
+    ],
+    eg:`{
+  "month_key": 202401,
+  "adviser_id": "A789",
+  "activity_type": "ANNUAL_REVIEW",
+  "activity_count": 12,
+  "avg_duration_mins": 88,
+  "completion_rate": 91.7,
+  "distinct_clients": 12
+}`,
+  },
+  client360_mart: {
+    id:'client360_mart', label:'Client 360 Data Mart', sub:'Denormalised', icon:'👤', layer:'datamart', azSvc:'synapsesql',
+    desc:'Denormalised client view combining client attributes, account summary, and activity history. Optimised for client analytics and segmentation. One row per client with aggregated account and activity metrics.',
+    attrs:['client_id','full_name','risk_profile','business_unit','adviser_id','total_aum','account_count','plan_types_held','last_review_date','reviews_ytd','recommendations_ytd'],
+    integration:'ADF triggers Synapse SQL stored procedure to join Client Dimension with aggregated Balance Fact and Activity Fact metrics. Results written to Synapse SQL table with HASH distribution on client_id.\n\nAzure Services: Data Factory, Synapse Analytics (Dedicated SQL Pool)',
+    details:[
+      {title:'Grain',text:'One row per client (denormalised)'},
+      {title:'Distribution',text:'HASH (client_id) - distributes rows across compute nodes'},
+      {title:'Attributes',items:['Client attributes (name, risk profile, business unit, adviser)','Account summary (total AUM, account count, plan types held)','Activity summary (last review date, reviews year-to-date, recommendations year-to-date)']},
+    ],
+    eg:`{
+  "client_id": "C12345",
+  "full_name": "Adrian Smith",
+  "risk_profile": "BALANCED",
+  "total_aum": 250000,
+  "account_count": 3,
+  "last_review_date": "2024-01-15",
+  "reviews_ytd": 1
+}`,
+  },
+
+  // ── Semantic Layer ─────────────────────────────────────────────────────────────────────────────────
+  glossary: {
+    id:'glossary', label:'Business Glossary', sub:'Semantic Layer', icon:'📖', layer:'datamart',
+    desc:'Centralised business definitions, metric calculations, and term standardisation. Defines "AUM", "Client Count", "Adviser Productivity" with precise calculation logic. Accessible to BI users, analysts, and AI tools for consistent understanding.',
+    details:[
+      {title:'Contents',items:['Metric definitions (e.g. AUM = SUM of market_value WHERE status = Active)','Business term glossary (e.g. ISA = Individual Savings Account, £20k annual limit)','Calculation rules (e.g. Crystallised % = crystallised / total_value * 100)','Data ownership (e.g. AUM metrics owned by Finance team)']},
+      {title:'Technology',text:'Azure Purview Data Catalog OR custom metadata database OR Power BI datasets with DAX measures documentation'},
+    ],
+    integration:'Business analysts define terms. Data team publishes to catalog. BI tools and AI query engines reference for context.',
+  },
+  lineage: {
+    id:'lineage', label:'Lineage', sub:'Semantic Layer', icon:'🔗', layer:'datamart',
+    desc:'End-to-end data lineage from source systems through Bronze, Silver, Gold to Data Marts and consumption. Tracks transformations, dependencies, and impact analysis. Enables "where did this number come from?" questions.',
+    details:[
+      {title:'Examples',items:['"AUM Data Mart.total_aum" aggregated from "Balance Fact.market_value" joined from "Silver Balance Data" merged from "Bronze Mabel + Bronze BW"','"Activity Data Mart.completion_rate" calculated from "Activity Fact.outcome" sourced from "Silver Activity Data" sourced from "Bronze HubWise"']},
+      {title:'Technology',text:'Azure Purview OR dbt lineage graphs OR custom lineage tracking in metadata database'},
+    ],
+    integration:'Automated lineage capture from ADF pipelines, Synapse SQL queries, and Power BI dataset refresh logs.',
+  },
+  dq_metrics: {
+    id:'dq_metrics', label:'DQ Metrics', sub:'Semantic Layer', icon:'📊', layer:'datamart', azSvc:'pbi',
+    desc:'Aggregated data quality scores and trends. Tracks completeness, accuracy, timeliness, and consistency across all layers. Published to BI dashboards for data stewards and business users.',
+    details:[
+      {title:'Metrics',items:['Completeness scores by source system (e.g. Curo client records 99.8% complete)','DQ issue trends (e.g. Mabel orphan accounts decreased from 50 to 12 this month)','Timeliness SLA tracking (e.g. Bronze ingestion completed by 07:00 95% of days)','Critical issue alerts (e.g. 15 CRITICAL severity DQ flags in last 7 days)']},
+      {title:'Technology',text:'Data Quality dashboard in Power BI querying DQ metadata table from Bronze V&R and Silver processing'},
+    ],
+    integration:'ADF pipelines log DQ metrics to Azure SQL metadata table. Power BI refreshes hourly.',
+  },
+  business_rules: {
+    id:'business_rules', label:'Business Rules', sub:'Semantic Layer', icon:'📜', layer:'datamart',
+    desc:'Codified business logic and regulatory rules applied in transformations. Documents ISA limits, pension crystallisation rules, risk profile classifications, and FCA compliance requirements.',
+    details:[
+      {title:'Examples',items:['"ISA Annual Limit: £20,000 per tax year (April to April)"','"SIPP Crystallisation: Age 55+ can crystallise up to 25% tax-free"','"Risk Profile Categories: Conservative (1-3), Balanced (4-6), Growth (7-10)"','"FCA Review Frequency: Minimum annual review for advised clients"']},
+      {title:'Technology',text:'Documented in Azure Purview OR dbt project documentation OR custom business rules repository'},
+    ],
+    integration:'Referenced in Silver/Gold transformation logic. Validated in DQ checks.',
+  },
+
+  // ── Security & Governance ────────────────────────────────────────────────────────────────────────────
+  rls: {
+    id:'rls', label:'Row-Level Security', sub:'Security & Governance', icon:'🔐', layer:'datamart', azSvc:'pbi',
+    desc:'Filters data based on user identity and business unit. Internal advisers see all clients. SPP (Saltus Partnership Programme) external advisers see only clients in their business unit. Clients see only their own accounts.',
+    details:[
+      {title:'Implementation',items:['Power BI RLS roles (Adviser, SPP Partner, Client)','Synapse SQL views with SECURITY POLICY filtering','Filter predicates: WHERE business_unit = USER_BUSINESS_UNIT() OR IS_INTERNAL_USER()']},
+      {title:'Technology',text:'Power BI Row-Level Security + Azure AD groups OR Synapse Dynamic Data Masking + Row-Level Security'},
+    ],
+    integration:'RLS policies configured in Power BI workspaces and Synapse SQL views. Azure AD group membership determines effective permissions.',
+  },
+  column_security: {
+    id:'column_security', label:'Column Security', sub:'Security & Governance', icon:'🔒', layer:'datamart',
+    desc:'Restricts access to sensitive columns based on role. Finance team sees all fields. Operations team sees client_id but not full name, address, or contact details (PII minimisation). Clients see balances but not internal cost/fee calculations.',
+    details:[
+      {title:'Implementation',items:['Synapse SQL views with selective column exposure','Power BI hidden columns for sensitive fields','Dynamic data masking for PII fields']},
+      {title:'Technology',text:'Synapse Dynamic Data Masking + Power BI field-level security'},
+    ],
+    integration:'Column restrictions enforced at Synapse SQL view layer. Power BI field-level permissions configured per workspace role.',
+  },
+  audit_logs: {
+    id:'audit_logs', label:'Access Audit Logs', sub:'Security & Governance', icon:'📋', layer:'datamart',
+    desc:'Comprehensive logging of all data access. Tracks who queried what data when. Supports FCA audit requirements and incident investigation. Logs retained for 7 years.',
+    details:[
+      {title:'Logged Events',items:['Power BI report views (user, report, timestamp)','Synapse SQL queries (user, tables accessed, row count returned)','Data Mart refreshes (pipeline, success/failure, duration)','DQ alert triggers (severity, source, resolution)']},
+      {title:'Technology',text:'Azure Monitor + Log Analytics workspace querying ADF pipeline logs, Synapse query logs, Power BI activity logs'},
+    ],
+    integration:'All platform components emit logs to Azure Monitor. Log Analytics workspace aggregates and indexes for querying. Retained 7 years for FCA compliance.',
+  },
+  rbac: {
+    id:'rbac', label:'RBAC Enforcement', sub:'Security & Governance', icon:'👥', layer:'datamart',
+    desc:'Role-Based Access Control across all platform components. Roles defined: Data Engineer, Data Analyst, Business User, Finance User, Compliance User, Client. Permissions enforced at Azure resource level, Synapse database level, and Power BI workspace level.',
+    details:[
+      {title:'Roles & Permissions',items:['Data Engineer: Full ADLS Gen2 + Synapse access (read/write all layers)','Data Analyst: Read access to Silver/Gold/Data Marts, write access to Power BI','Business User: Power BI consumption only (no direct database access)','Finance User: Power BI + direct query to Finance-specific Data Marts','Compliance User: Read-only access to DQ metadata and audit logs','Client: Power BI embedded reports with RLS filtering to own accounts only']},
+      {title:'Technology',text:'Azure RBAC + Azure AD groups + Synapse database roles + Power BI workspace roles'},
+    ],
+    integration:'Azure AD groups mapped to RBAC roles. Synapse database role assignments aligned with AD groups. Power BI workspace roles match RBAC definitions.',
+  },
+
+  abi_wabi: {
+    id:'abi_wabi', label:'ABI / WABI', sub:'Power BI', icon:'📊', layer:'consumer', azSvc:'pbi',
+    desc:'Primary BI platform. Adviser-facing reports for productivity, AUM trends and client analytics. DirectQuery against Azure Synapse Analytics via Power BI Premium. Web (WABI) and desktop (ABI).',
+    attrs:['Adviser Dashboard','AUM Trends','Client Analytics','Review Compliance','Revenue Attribution'],
+    integration:'Power BI Premium DirectQuery to Azure Synapse Analytics Dedicated SQL Pool. Refreshes every 2h via Power BI gateway. Azure Analysis Services semantic cache layer for high-concurrency workloads.',
+    freq:'Refresh every 2h (07:00–20:00)', vol:'~200 users (advisers + managers)',
+    eg:`{
+  "report": "Adviser Dashboard",
+  "adviser_id": "A789",
+  "aum_current": 45000000,
+  "client_count": 180,
+  "reviews_due": 12,
+  "avg_portfolio_size": 250000
+}`,
+  },
+  fbi: {
+    id:'fbi', label:'FBI', sub:'Finance BI', icon:'💼', layer:'consumer', azSvc:'pbi',
+    desc:'Finance team BI platform. AUM by business unit, revenue analysis, fee reconciliation and board reporting. Connects to Synapse Analytics via Power BI Premium with row-level security by business unit.',
+    attrs:['AUM by BU','Revenue Analysis','Fee Reconciliation','Management Reporting','Board Packs'],
+    integration:'Power BI Premium DirectQuery to Synapse Dedicated SQL Pool. Finance-specific semantic model deployed to Power BI Premium capacity with RLS enforced at the Synapse SQL view layer.',
+    freq:'Near real-time', vol:'~10 users (finance team)',
+    eg:`{
+  "report": "Monthly AUM",
+  "business_unit": "RB",
+  "date": "2024-01-31",
+  "total_aum": 2800000000,
+  "aum_change_mtd": 45000000,
+  "revenue_estimate": 8400000
+}`,
+  },
+  portal: {
+    id:'portal', label:'Client Portal', sub:'REST API', icon:'🌐', layer:'consumer', azSvc:'apim',
+    desc:'Client-facing web portal and mobile app. Real-time balance queries via Azure API Management fronting a .NET API backed by Azure Synapse Analytics read replicas with Azure Cache for Redis.',
+    attrs:['GET /accounts/{id}/balance','GET /accounts/{id}/holdings','GET /clients/{id}/summary','GET /accounts/{id}/transactions'],
+    integration:'Azure API Management → .NET API → Synapse Analytics Serverless SQL Pool (read-optimised). Azure Cache for Redis (15 min TTL) for high-frequency balance queries. Azure Front Door for global load balancing.',
+    freq:'Real-time (cached 15 min)', vol:'~10k clients · ~50k API calls/day',
+    eg:`// GET /accounts/ACC001/balance
+{
+  "account_id": "ACC001",
+  "market_value": 250000.00,
+  "cash": 5000.00,
+  "change_1d": +1250.00,
+  "change_1d_pct": 0.50,
+  "as_of": "2024-01-15T16:30:00Z"
+}`,
+  },
+};
+
+const CONNS = [
+  // Source → Bronze
+  {f:'curo',t:'bronze_curo',lbl:'ADF SQL connector to ADLS Gen2'},{f:'mabel',t:'bronze_mabel',lbl:'ADF SFTP to ADLS Gen2'},{f:'hubwise',t:'bronze_hubwise',lbl:'ADF copy to ADLS Gen2'},{f:'bw',t:'bronze_bw',lbl:'Blob write via Functions trigger'},
+  // Bronze → V&R (validation pass, horizontal left-to-right)
+  {f:'bronze_curo',t:'bronze_vr',lbl:'Data sent to Validation & Reconciliation for quality checks',horizontal:true},{f:'bronze_mabel',t:'bronze_vr',lbl:'Data sent to Validation & Reconciliation for quality checks',horizontal:true},{f:'bronze_hubwise',t:'bronze_vr',lbl:'Data sent to Validation & Reconciliation for quality checks',horizontal:true},{f:'bronze_bw',t:'bronze_vr',lbl:'Data sent to Validation & Reconciliation for quality checks',horizontal:true},
+  // V&R → Bronze feedback loops (horizontal right-to-left, amber)
+  {f:'bronze_vr',t:'bronze_curo',lbl:'Feedback loop: DQ flags and metadata written back to Bronze',feedback:true,horizontal:true},{f:'bronze_vr',t:'bronze_mabel',lbl:'Feedback loop: DQ flags and metadata written back to Bronze',feedback:true,horizontal:true},{f:'bronze_vr',t:'bronze_hubwise',lbl:'Feedback loop: DQ flags and metadata written back to Bronze',feedback:true,horizontal:true},{f:'bronze_vr',t:'bronze_bw',lbl:'Feedback loop: DQ flags and metadata written back to Bronze',feedback:true,horizontal:true},
+  // Bronze → Silver
+  {f:'bronze_curo',t:'client_master',lbl:'ADF to Synapse SQL: deduplication and standardisation'},{f:'bronze_curo',t:'account_master',lbl:'ADF to Synapse SQL: cross-source join'},{f:'bronze_mabel',t:'account_master',lbl:'ADF to Synapse SQL: cross-source join'},{f:'bronze_mabel',t:'balance_data',lbl:'ADF to Synapse SQL: balance merge'},{f:'bronze_hubwise',t:'activity_data',lbl:'ADF to Synapse SQL: referential integrity and standardisation'},{f:'bronze_bw',t:'balance_data',lbl:'ADF to Synapse SQL: crystallisation enrichment'},
+  // Silver → Gold
+  {f:'client_master',t:'client_dim',lbl:'ADF SCD2 to Synapse SQL'},{f:'account_master',t:'account_dim',lbl:'ADF SCD2 to Synapse SQL'},{f:'balance_data',t:'balance_fact',lbl:'ADF COPY INTO to Synapse SQL'},{f:'activity_data',t:'activity_fact',lbl:'ADF COPY INTO to Synapse SQL'},{f:'activity_data',t:'adviser_dim',lbl:'ADF SCD2 to Synapse SQL'},
+  // Gold → Data Marts
+  {f:'balance_fact',t:'aum_mart',lbl:'ADF aggregates Balance Fact into AUM Data Mart daily'},{f:'activity_fact',t:'activity_mart',lbl:'ADF aggregates Activity Fact into Activity Data Mart monthly'},{f:'client_dim',t:'client360_mart',lbl:'ADF joins Client Dimension into Client 360 Data Mart'},{f:'balance_fact',t:'client360_mart',lbl:'ADF aggregates Balance Fact into Client 360 Data Mart'},{f:'activity_fact',t:'client360_mart',lbl:'ADF aggregates Activity Fact into Client 360 Data Mart'},
+  // Data Marts → Power BI Consumers
+  {f:'aum_mart',t:'abi_wabi',lbl:'Power BI DirectQuery to AUM Data Mart'},{f:'activity_mart',t:'abi_wabi',lbl:'Power BI DirectQuery to Activity Data Mart'},{f:'client360_mart',t:'abi_wabi',lbl:'Power BI DirectQuery to Client 360 Data Mart'},{f:'aum_mart',t:'fbi',lbl:'Power BI DirectQuery to AUM Data Mart'},{f:'client360_mart',t:'fbi',lbl:'Power BI DirectQuery to Client 360 Data Mart'},
+  // Gold → Portal (direct real-time API queries)
+  {f:'client_dim',t:'portal',lbl:'APIM to Synapse Serverless'},{f:'account_dim',t:'portal',lbl:'APIM to Synapse Serverless'},{f:'time_dim',t:'portal',lbl:'APIM to Synapse Serverless'},{f:'balance_fact',t:'portal',lbl:'APIM to Synapse Serverless'},
+];
+
+const LAYERS = [
+  {key:'source',   label:'SOURCE SYSTEMS',                    rows:[['curo','mabel','hubwise','bw']]},
+  {key:'bronze',   label:'BRONZE: Raw Landing (ADLS Gen2)',  rows:[['bronze_curo','bronze_mabel','bronze_hubwise','bronze_bw']], sidebar:'bronze_vr'},
+  {key:'silver',   label:'SILVER: Synapse SQL Processing',   rows:[['client_master','account_master','balance_data','activity_data']]},
+  {key:'gold',     label:'GOLD: Synapse Dedicated SQL Pool', rows:[['client_dim','account_dim','adviser_dim','time_dim','balance_fact','activity_fact']]},
+  {key:'datamart', label:'DATA MARTS + SEMANTIC LAYER',      rows:[['aum_mart','activity_mart','client360_mart'],['glossary','lineage','dq_metrics','business_rules'],['rls','column_security','audit_logs','rbac']], rowLabels:['Data Marts','Semantic Layer','Security & Governance']},
+  {key:'consumer', label:'CONSUMERS',                         rows:[['abi_wabi','fbi','portal']]},
+];
+
+// ── NodeLogo ──────────────────────────────────────────────────────────────────
+function NodeLogo({ node, dim }) {
+  const [failed, setFailed] = useState(false);
+  const url = node.logo ? LOGOS[node.logo] : null;
+
+  // Image logo (Mabel square, Hubwise wide)
+  if (url && !failed) {
+    const isSquare = node.logo === 'mabel';
+    return (
+      <img src={url} onError={() => setFailed(true)}
+        style={{
+          height: isSquare ? 36 : 26, width: isSquare ? 36 : 'auto',
+          maxWidth: 120, objectFit: 'contain', marginBottom: 6,
+          opacity: dim ? 0.35 : 0.88, transition: 'opacity 0.2s',
+        }} alt={node.label}/>
+    );
+  }
+
+  // Styled text monogram for source systems with no logo (e.g. CURO)
+  if (node.layer === 'source') {
+    const c = LC[node.layer];
+    return (
+      <div style={{
+        fontSize: 13, fontWeight: 800, letterSpacing: 2,
+        color: dim ? `${c}44` : c,
+        marginBottom: 6, textTransform: 'uppercase',
+        fontFamily: "'Montserrat', sans-serif",
+        transition: 'color 0.2s',
+      }}>{node.label}</div>
+    );
+  }
+
+  return <div style={{fontSize:20, marginBottom:6, opacity: dim ? 0.3 : 1}}>{node.icon}</div>;
+}
+
+// ── ConnLine ──────────────────────────────────────────────────────────────────
+// horizontal=true : Bronze <-> V&R connections (left/right, same layer row)
+//   feedback=false : Bronze → V&R  (from.right → to.left), slightly above centre
+//   feedback=true  : V&R → Bronze  (from.left → to.right), slightly below centre, amber
+// horizontal=false: all other vertical connections (top/bottom, layer to layer)
+function ConnLine({ from, to, highlighted, dimmed, label, idx, onHover, onLeave, feedback, horizontal }) {
+  if (!from || !to) return null;
+
+  let d;
+  if (horizontal) {
+    // S-curve running left/right. Offset vertically by ±8px to separate forward/feedback.
+    const yOff = feedback ? 8 : -8;
+    if (feedback) {
+      // V&R (right side) → Bronze (left side): right-to-left
+      const x1 = from.left  - 2,  y1 = from.cy + yOff;
+      const x2 = to.right   + 2,  y2 = to.cy   + yOff;
+      const mx = (x1 + x2) / 2;
+      d = `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+    } else {
+      // Bronze (left side) → V&R (right side): left-to-right
+      const x1 = from.right + 2,  y1 = from.cy + yOff;
+      const x2 = to.left    - 2,  y2 = to.cy   + yOff;
+      const mx = (x1 + x2) / 2;
+      d = `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+    }
+  } else {
+    // Vertical S-curve (normal top-to-bottom flow)
+    const x1 = from.cx, y1 = from.bottom + 2;
+    const x2 = to.cx,   y2 = to.top - 2;
+    const my = (y1 + y2) / 2;
+    d = `M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2}`;
+  }
+
+  const feedbackColour = '#f59e0b';  // amber, matches bronze layer colour
+  const defaultStroke  = feedback ? `${feedbackColour}55` : 'rgba(0,120,212,0.3)';
+  const hlStroke       = feedback ? feedbackColour : B.azCyan;
+  const stroke = highlighted ? hlStroke : dimmed ? 'rgba(220,232,245,0.05)' : defaultStroke;
+  const sw     = highlighted ? 2.5 : 1.5;
+  const dash   = highlighted ? undefined : feedback ? '3 5' : '5 4';
+
+  return (
+    <g>
+      <path d={d} fill="none" stroke={stroke} strokeWidth={sw}
+        strokeDasharray={dash}
+        style={{transition:'stroke 0.25s, stroke-width 0.2s'}}/>
+      {highlighted && (
+        <circle r="4" fill={hlStroke} opacity="0.9">
+          <animateMotion dur={feedback ? '1.8s' : '1.4s'} repeatCount="indefinite" path={d}/>
+        </circle>
+      )}
+      <path d={d} fill="none" stroke="transparent" strokeWidth="14"
+        style={{cursor:'pointer', pointerEvents:'stroke'}}
+        onMouseEnter={e => onHover(idx, label, e)}
+        onMouseLeave={onLeave}/>
+    </g>
+  );
+}
+
+// ── NodeCard ──────────────────────────────────────────────────────────────────
+function NodeCard({ node, selected, highlighted, dimmed, onClick, onEnter, onLeave, nodeRef }) {
+  const c = LC[node.layer];
+  const active = highlighted || selected;
+  return (
+    <div ref={nodeRef}
+      onClick={() => onClick(node)}
+      onMouseEnter={() => onEnter(node.id)}
+      onMouseLeave={onLeave}
+      style={{
+        background: active ? `${c}20` : `${c}0c`,
+        border: `1.5px solid ${active ? (selected ? B.azCyan : c) : `${c}50`}`,
+        borderRadius: 10, padding: '11px 13px', cursor: 'pointer',
+        transition: 'all 0.2s', opacity: dimmed ? 0.18 : 1,
+        minWidth: 148, maxWidth: 182, textAlign: 'center',
+        display: 'flex', flexDirection: 'column', alignItems: 'center',
+        boxShadow: active
+          ? `0 0 22px ${selected ? B.azCyan : c}44, 0 4px 16px rgba(0,0,0,0.55)`
+          : '0 2px 10px rgba(0,0,0,0.4)',
+        transform: active ? 'translateY(-3px) scale(1.04)' : 'none',
+      }}>
+      <NodeLogo node={node} dim={dimmed}/>
+      <div style={{fontSize:12, fontWeight:700, color: active ? '#fff' : B.text, letterSpacing:0.3}}>{node.label}</div>
+      <div style={{fontSize:9.5, fontWeight:500, color:c, opacity:0.85, marginTop:3, textTransform:'uppercase', letterSpacing:0.8}}>{node.sub}</div>
+      {(node.azSvcs || (node.azSvc ? [node.azSvc] : [])).length > 0 && (
+        <div style={{marginTop:7, display:'flex', flexWrap:'wrap', gap:3, justifyContent:'center'}}>
+          {(node.azSvcs || [node.azSvc]).map(t => <AzBadge key={t} type={t} inline/>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Detail Panel ──────────────────────────────────────────────────────────────
+function DetailPanel({ node, onClose }) {
+  if (!node) return (
+    <div style={{padding:32, textAlign:'center', color:'rgba(220,232,245,0.2)', marginTop:80}}>
+      <div style={{fontSize:36, marginBottom:14, opacity:0.4}}>←</div>
+      <div style={{fontSize:12, fontWeight:500, letterSpacing:0.3}}>Click any node to<br/>view details</div>
+    </div>
+  );
+
+  const c = LC[node.layer];
+  const layerNames = {source:'Source System', bronze:'Bronze Layer', silver:'Silver Layer', gold:'Gold Layer', consumer:'Consumer'};
+  const svc = node.azSvc ? AZ_SERVICES[node.azSvc] : null;
+  const svcs = node.azSvcs ? node.azSvcs.map(t => AZ_SERVICES[t]).filter(Boolean) : (svc ? [svc] : []);
+  const svcTypes = node.azSvcs || (node.azSvc ? [node.azSvc] : []);
+
+  return (
+    <div style={{padding:22}}>
+      <div style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:14}}>
+        <div style={{flex:1}}>
+          <div style={{fontSize:9, fontWeight:700, textTransform:'uppercase', letterSpacing:2, color:B.azBlue, marginBottom:8}}>
+            {layerNames[node.layer]}
+          </div>
+          {node.logo && LOGOS[node.logo]
+            ? <img src={LOGOS[node.logo]}
+                style={{height: node.logo==='mabel' ? 42 : 28, maxWidth:160, objectFit:'contain', marginBottom:8, display:'block'}}
+                onError={e => { e.target.style.display='none'; }}
+                alt={node.label}/>
+            : node.layer === 'source'
+              ? <div style={{fontSize:20, fontWeight:800, letterSpacing:3, color:LC[node.layer],
+                  marginBottom:8, textTransform:'uppercase', fontFamily:"'Montserrat',sans-serif"}}>{node.label}</div>
+              : <div style={{fontSize:24, marginBottom:8}}>{node.icon}</div>
+          }
+          <div style={{fontSize:18, fontWeight:700, color:'#fff', letterSpacing:0.2}}>{node.label}</div>
+          <div style={{fontSize:10, fontWeight:600, color:c, textTransform:'uppercase', letterSpacing:1, marginTop:3}}>{node.sub}</div>
+        </div>
+        <button onClick={onClose}
+          style={{background:'none', border:`1px solid rgba(0,120,212,0.35)`, borderRadius:6,
+            color:'rgba(220,232,245,0.45)', cursor:'pointer', fontSize:14, lineHeight:1,
+            padding:'5px 8px', marginLeft:10, fontFamily:"'Montserrat',sans-serif"}}>✕</button>
+      </div>
+
+      {/* Azure service block(s) */}
+      {svcs.length > 0 && (
+        <div style={{display:'flex', flexDirection:'column', gap:6, marginBottom:18}}>
+          {svcs.map((s, si) => (
+            <div key={si} style={{
+              display:'flex', alignItems:'center', gap:10,
+              background:`${s.color}12`, border:`1px solid ${s.color}44`,
+              borderRadius:8, padding:'10px 12px',
+            }}>
+              <AzureIcon type={svcTypes[si]} size={26}/>
+              <div>
+                <div style={{fontSize:11, fontWeight:700, color:s.color}}>{s.name}</div>
+                <div style={{fontSize:10, color:'rgba(220,232,245,0.5)', marginTop:2}}>{s.abbr}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{height:1, background:`linear-gradient(90deg, ${B.azBlue}88, transparent)`, marginBottom:18}}/>
+
+      <Sec title="Description">
+        <p style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400}}>{node.desc}</p>
+      </Sec>
+
+      {node.capabilities && (
+        <Sec title="Capabilities">
+          <ul style={{margin:0, paddingLeft:16, listStyle:'disc'}}>
+            {node.capabilities.map((cap, i) => (
+              <li key={i} style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400, marginBottom:2}}>{cap}</li>
+            ))}
+          </ul>
+        </Sec>
+      )}
+
+      {node.outputs && (
+        <Sec title="Outputs">
+          <ul style={{margin:0, paddingLeft:16, listStyle:'disc'}}>
+            {node.outputs.map((out, i) => (
+              <li key={i} style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400, marginBottom:2}}>{out}</li>
+            ))}
+          </ul>
+        </Sec>
+      )}
+
+      {node.attrs && node.attrs.length > 0 && (
+        <Sec title="Attributes & Fields">
+          <div style={{display:'flex', flexWrap:'wrap', gap:4}}>
+            {node.attrs.map(a => (
+              <span key={a} style={{
+                background:'rgba(0,120,212,0.12)', border:'1px solid rgba(0,120,212,0.25)',
+                borderRadius:4, padding:'2px 8px', fontSize:10.5, fontFamily:'monospace',
+                color:'rgba(220,232,245,0.85)',
+              }}>{a}</span>
+            ))}
+          </div>
+        </Sec>
+      )}
+
+      <Sec title="Integration & Azure Services">
+        {node.integration.split('\n\n').map((para, i) => (
+          <p key={i} style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400, marginBottom: i < node.integration.split('\n\n').length-1 ? 10 : 0}}>{para}</p>
+        ))}
+      </Sec>
+
+      {node.triggerType && (
+        <Sec title="Trigger Type">
+          <p style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400}}>{node.triggerType}</p>
+        </Sec>
+      )}
+
+      {node.details && node.details.map(({title,text,items},di) => (
+        <Sec key={di} title={title}>
+          {text
+            ? <p style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400}}>{text}</p>
+            : <ul style={{margin:0, paddingLeft:16, listStyle:'disc'}}>
+                {items.map((item,ii) => <li key={ii} style={{fontSize:12.5, lineHeight:1.8, color:'rgba(220,232,245,0.82)', fontWeight:400, marginBottom:2}}>{item}</li>)}
+              </ul>
+          }
+        </Sec>
+      ))}
+
+      {node.eg && (
+        <Sec title="Example Payload">
+          <pre style={{
+            background:'#030c14', borderRadius:8, padding:14,
+            fontFamily:"'Courier New',monospace", fontSize:11, color:'#7dd3f8',
+            border:'1px solid rgba(0,120,212,0.15)',
+            overflowX:'auto', whiteSpace:'pre', lineHeight:1.65, margin:0,
+          }}>{node.eg}</pre>
+        </Sec>
+      )}
+    </div>
+  );
+}
+
+function Sec({title, children}) {
+  return (
+    <div style={{marginBottom:18}}>
+      <div style={{fontSize:9, fontWeight:700, textTransform:'uppercase', letterSpacing:1.8,
+        color:'rgba(0,120,212,0.7)', marginBottom:8}}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function Pill({label, value}) {
+  return (
+    <div style={{flex:1, background:'rgba(0,120,212,0.1)', border:'1px solid rgba(0,120,212,0.25)',
+      borderRadius:8, padding:'9px 11px'}}>
+      <div style={{fontSize:9, color:B.azBlue, fontWeight:700, textTransform:'uppercase',
+        letterSpacing:0.8, marginBottom:4}}>{label}</div>
+      <div style={{fontSize:11, color:'rgba(220,232,245,0.8)', lineHeight:1.45, fontWeight:500}}>{value}</div>
+    </div>
+  );
+}
+
+// ── Tooltip ───────────────────────────────────────────────────────────────────
+function Tooltip({text, x, y}) {
+  if (!text) return null;
+  return (
+    <div style={{
+      position:'fixed', left:x+16, top:y-10,
+      background:B.saltus, border:'1px solid rgba(0,120,212,0.4)',
+      borderRadius:8, padding:'8px 13px', fontSize:11.5, color:B.text,
+      pointerEvents:'none', zIndex:9999, boxShadow:'0 6px 28px rgba(0,0,0,0.7)',
+      maxWidth:240, fontFamily:"'Montserrat',sans-serif", fontWeight:500,
+    }}>
+      <div style={{fontSize:9, fontWeight:700, textTransform:'uppercase', letterSpacing:1.5,
+        color:B.azCyan, marginBottom:4}}>Azure Data Flow</div>
+      {text}
+    </div>
+  );
+}
+
+// ── Saltus logo in header ─────────────────────────────────────────────────────
+function SaltusLogo() {
+  const [failed, setFailed] = useState(false);
+  if (!failed) return (
+    // URL is a 400x400 square icon, displayed at 92x92 in the 104px header
+    <img src={LOGOS.saltus} onError={() => setFailed(true)}
+      style={{height:92, width:92, objectFit:'contain', borderRadius:6}} alt="Saltus"/>
+  );
+  return (
+    <div style={{fontSize:17, fontWeight:800, letterSpacing:3, color:'#fff',
+      textTransform:'uppercase', fontFamily:"'Montserrat',sans-serif"}}>SALTUS</div>
+  );
+}
+
+// ── Azure stack summary strip ─────────────────────────────────────────────────
+function AzureStack() {
+  const stack = [
+    { type:'adls',    label:'ADLS Gen2' },
+    { type:'adf',     label:'Data Factory' },
+    { type:'fn',      label:'Functions' },
+    { type:'synapse', label:'Synapse Analytics' },
+  ];
+  return (
+    <div style={{display:'flex', gap:8, marginLeft:'auto', alignItems:'center', flexWrap:'wrap'}}>
+      {stack.map(({ type, label }) => {
+        const svc = AZ_SERVICES[type];
+        return (
+          <div key={type} style={{
+            display:'flex', alignItems:'center', gap:5,
+            background:`${svc.color}18`, border:`1px solid ${svc.color}44`,
+            borderRadius:5, padding:'4px 9px',
+          }}>
+            <AzureIcon type={type} size={14}/>
+            <span style={{fontSize:10, fontWeight:600, color:svc.color,
+              fontFamily:"'Montserrat',sans-serif", whiteSpace:'nowrap'}}>{label}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── App ────────────────────────────────────────────────────────────────────────
+function App() {
+  const [sel,   setSel]   = useState(null);
+  const [hNode, setHNode] = useState(null);
+  const [hConn, setHConn] = useState(null);
+  const [tip,   setTip]   = useState(null);
+  const [pos,   setPos]   = useState({});
+  const refs = useRef({});
+  const wrap = useRef(null);
+
+  const updatePos = useCallback(() => {
+    if (!wrap.current) return;
+    const cr = wrap.current.getBoundingClientRect();
+    const p  = {};
+    Object.entries(refs.current).forEach(([id, el]) => {
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const top    = r.top    - cr.top;
+      const left   = r.left   - cr.left;
+      const bottom = top  + r.height;
+      const right  = left + r.width;
+      p[id] = { cx: left + r.width/2, cy: top + r.height/2, top, bottom, left, right };
+    });
+    setPos(p);
+  }, []);
+
+  useEffect(() => {
+    updatePos();
+    window.addEventListener('resize', updatePos);
+    return () => window.removeEventListener('resize', updatePos);
+  }, [updatePos]);
+
+  const { hlNodes, hlConns } = useMemo(() => {
+    if (!hNode && hConn === null) return { hlNodes: new Set(), hlConns: new Set() };
+    const hlN = new Set(), hlC = new Set();
+    if (hNode) {
+      hlN.add(hNode);
+      CONNS.forEach((c,i) => { if (c.f===hNode||c.t===hNode) { hlC.add(i); hlN.add(c.f); hlN.add(c.t); } });
+    }
+    if (hConn !== null) {
+      hlC.add(hConn);
+      const cc = CONNS[hConn];
+      if (cc) { hlN.add(cc.f); hlN.add(cc.t); }
+    }
+    return { hlNodes: hlN, hlConns: hlC };
+  }, [hNode, hConn]);
+
+  const hasHover = hNode || hConn !== null;
+
+  const svgH = useMemo(() => {
+    if (!Object.keys(pos).length) return 1400;
+    return Math.max(...Object.values(pos).map(p => p.bottom)) + 80;
+  }, [pos]);
+
+  const onConnHover = useCallback((i, lbl, e) => { setHConn(i); setTip({text:lbl, x:e.clientX, y:e.clientY}); }, []);
+  const onConnLeave = useCallback(() => { setHConn(null); setTip(null); }, []);
+
+  return (
+    <div style={{display:'flex', height:'100vh', background:B.bg, color:B.text,
+      fontFamily:"'Montserrat', -apple-system, sans-serif"}}>
+
+      {/* ── Main diagram ── */}
+      <div style={{flex:1, display:'flex', flexDirection:'column', overflow:'hidden', minWidth:0}}>
+
+        {/* ── Header ── */}
+        <div style={{
+          padding:'0 22px', background:B.saltus,
+          borderBottom:'1px solid rgba(0,120,212,0.3)',
+          display:'flex', alignItems:'center', gap:0, flexShrink:0, height:104,
+        }}>
+          <div style={{display:'flex', alignItems:'center', gap:12, minWidth:160}}>
+            <SaltusLogo/>
+          </div>
+          <div style={{width:1, height:28, background:'rgba(0,120,212,0.4)', margin:'0 18px'}}/>
+          <div>
+            <div style={{fontSize:13, fontWeight:700, color:'#fff', letterSpacing:0.3}}>Data Warehouse Architecture</div>
+            <div style={{fontSize:10, color:'rgba(220,232,245,0.38)', marginTop:1, fontWeight:400, letterSpacing:0.2}}>
+              Azure Medallion Architecture: Interactive Lineage Map
+            </div>
+          </div>
+          <AzureStack/>
+        </div>
+
+        {/* ── Layer legend + instruction ── */}
+        <div style={{
+          padding:'7px 22px', background:'rgba(13,30,48,0.7)',
+          borderBottom:'1px solid rgba(0,120,212,0.1)',
+          display:'flex', alignItems:'center', gap:16, flexShrink:0, flexWrap:'wrap',
+        }}>
+          {[['#3b82f6','Sources'],['#f59e0b','Bronze'],['#94a3b8','Silver'],['#eab308','Gold'],['#8b5cf6','Data Marts'],['#22c55e','Consumers']].map(([c,l]) => (
+            <div key={l} style={{display:'flex', alignItems:'center', gap:5, fontSize:10.5, fontWeight:500}}>
+              <div style={{width:8, height:8, borderRadius:'50%', background:c}}/>
+              <span style={{color:'rgba(220,232,245,0.45)'}}>{l}</span>
+            </div>
+          ))}
+          <div style={{fontSize:10.5, color:'rgba(220,232,245,0.25)', fontWeight:400, marginLeft:'auto'}}>
+            Hover to trace · Click for Azure details
+          </div>
+        </div>
+
+        {/* ── Scrollable diagram ── */}
+        <div style={{flex:1, overflow:'auto', padding:'28px 36px 48px'}}>
+          <div ref={wrap} style={{position:'relative', minWidth:900}}>
+
+            {/* SVG connections */}
+            <svg style={{position:'absolute', top:0, left:0, width:'100%', overflow:'visible', pointerEvents:'none'}}
+              height={svgH}>
+              {CONNS.map((c,i) => (
+                <ConnLine key={i} idx={i}
+                  from={pos[c.f]} to={pos[c.t]}
+                  highlighted={hlConns.has(i)}
+                  dimmed={hasHover && !hlConns.has(i)}
+                  label={c.lbl}
+                  feedback={!!c.feedback}
+                  horizontal={!!c.horizontal}
+                  onHover={onConnHover}
+                  onLeave={onConnLeave}/>
+              ))}
+            </svg>
+
+            {/* Layers */}
+            {LAYERS.map((layer, li) => (
+              <div key={layer.key} style={{marginBottom: li < LAYERS.length-1 ? 72 : 0}}>
+                <div style={{display:'flex', alignItems:'center', gap:12, marginBottom:14}}>
+                  <div style={{flex:1, height:1, background:`linear-gradient(90deg, transparent, ${LC[layer.key]}44)`}}/>
+                  <div style={{
+                    fontSize:9, fontWeight:700, textTransform:'uppercase', letterSpacing:2.5,
+                    color:LC[layer.key], whiteSpace:'nowrap', padding:'4px 14px',
+                    border:`1px solid ${LC[layer.key]}44`, borderRadius:20,
+                    background:`${LC[layer.key]}0e`,
+                  }}>{layer.label}</div>
+                  <div style={{flex:1, height:1, background:`linear-gradient(90deg, ${LC[layer.key]}44, transparent)`}}/>
+                </div>
+                <div style={{display:'flex', alignItems:'center', gap:0}}>
+                  {/* Main rows */}
+                  <div style={{flex:1}}>
+                    {layer.rows.map((rowIds, ri) => (
+                      <div key={ri} style={{marginBottom: ri < layer.rows.length - 1 ? 22 : 0}}>
+                        {layer.rowLabels && layer.rowLabels[ri] && (
+                          <div style={{
+                            fontSize:8, fontWeight:700, textTransform:'uppercase', letterSpacing:2,
+                            color:`${LC[layer.key]}99`, marginBottom:8, textAlign:'center',
+                            borderBottom:`1px solid ${LC[layer.key]}22`, paddingBottom:6,
+                          }}>{layer.rowLabels[ri]}</div>
+                        )}
+                      <div style={{
+                        display:'flex', justifyContent:'center', gap:14, flexWrap:'wrap',
+                      }}>
+                        {rowIds.map(id => {
+                          const node = NODES[id];
+                          const hl = hlNodes.has(id);
+                          const dm = hasHover && !hl;
+                          return (
+                            <NodeCard key={id} node={node}
+                              selected={sel?.id===id} highlighted={hl} dimmed={dm}
+                              onClick={setSel} onEnter={setHNode}
+                              onLeave={() => setHNode(null)}
+                              nodeRef={el => refs.current[id]=el}/>
+                          );
+                        })}
+                      </div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Sidebar V&R node */}
+                  {layer.sidebar && (() => {
+                    const sid  = layer.sidebar;
+                    const node = NODES[sid];
+                    const hl   = hlNodes.has(sid);
+                    const dm   = hasHover && !hl;
+                    return (
+                      <div style={{display:'flex', alignItems:'center', gap:0, flexShrink:0}}>
+                        {/* Divider with label */}
+                        <div style={{
+                          width:1, alignSelf:'stretch', background:`${LC[layer.key]}33`,
+                          margin:'0 18px', position:'relative', flexShrink:0,
+                        }}>
+                          <div style={{
+                            position:'absolute', top:'50%', left:'50%',
+                            transform:'translate(-50%,-50%) rotate(-90deg)',
+                            fontSize:8, fontWeight:700, textTransform:'uppercase',
+                            letterSpacing:1.5, color:`${LC[layer.key]}88`,
+                            whiteSpace:'nowrap', pointerEvents:'none',
+                          }}>V&amp;R</div>
+                        </div>
+                        <NodeCard node={node}
+                          selected={sel?.id===sid} highlighted={hl} dimmed={dm}
+                          onClick={setSel} onEnter={setHNode}
+                          onLeave={() => setHNode(null)}
+                          nodeRef={el => refs.current[sid]=el}/>
+                      </div>
+                    );
+                  })()}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Detail panel ── */}
+      <div style={{
+        width:375, background:B.panel,
+        borderLeft:'1px solid rgba(0,120,212,0.15)',
+        overflowY:'auto', flexShrink:0,
+      }}>
+        <div style={{height:3, background:`linear-gradient(90deg, ${B.azBlue}, ${B.azCyan}, transparent)`}}/>
+        <DetailPanel node={sel} onClose={() => setSel(null)}/>
+      </div>
+
+      {tip && <Tooltip text={tip.text} x={tip.x} y={tip.y}/>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
