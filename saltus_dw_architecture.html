@@ -175,10 +175,10 @@ const NODES = {
 
   bronze_curo: {
     id:'bronze_curo', label:'Bronze CURO', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'adls',
-    desc:'Landing zone in ADLS Gen2 for Curo BI database snapshot. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    desc:'Landing zone in ADLS Gen2 for Curo BI incremental changes. CDC pattern captures only modified records. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
     attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
-    integration:'ADF scheduled pipeline extracts database snapshot, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Data Factory, ADLS Gen2',
-    triggerType:'Scheduled (not batch - event-driven after schedule triggers)',
+    integration:'ADF incremental load pattern polls Curo BI database at regular intervals, converts changed records to Parquet, sends to Validation & Reconciliation for quality checks. Watermark metadata table tracks last processed timestamp per table. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Data Factory, ADLS Gen2, Azure SQL (watermark tracking)',
+    triggerType:'Scheduled incremental (ADF timer trigger at regular intervals, processes only changes)',
     eg:`{
   "_ingestion_date": "2024-01-15",
   "_source": "curo_bi",
@@ -191,10 +191,10 @@ const NODES = {
   },
   bronze_mabel: {
     id:'bronze_mabel', label:'Bronze MABEL', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'adls',
-    desc:'Landing zone in ADLS Gen2 for Mabel portfolio files. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    desc:'Landing zone in ADLS Gen2 for Mabel portfolio incremental changes. API polling pattern captures only updated portfolios. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
     attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
-    integration:'Files received via SFTP to ADLS Gen2, Azure Function Blob Trigger detects arrival, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions, Data Factory, ADLS Gen2',
-    triggerType:'Event-driven (Blob Trigger on file arrival)',
+    integration:'Azure Functions timer trigger polls Mabel API regularly for changes, retrieves changed portfolios, converts to Parquet, sends to Validation & Reconciliation for quality checks. Watermark metadata table tracks last processed timestamp. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions (timer trigger), Azure API Management (Mabel API gateway), ADLS Gen2, Azure SQL (watermark tracking)',
+    triggerType:'Scheduled incremental (Azure Functions timer trigger at regular intervals, API polling for changes)',
     eg:`{
   "_ingestion_date": "2024-01-15",
   "_source": "mabel",
@@ -207,10 +207,10 @@ const NODES = {
   },
   bronze_hubwise: {
     id:'bronze_hubwise', label:'Bronze HUBWISE', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'adls',
-    desc:'Landing zone in ADLS Gen2 for HubWise activity data. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    desc:'Landing zone in ADLS Gen2 for HubWise activity incremental changes. API polling pattern captures activities logged since last poll. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
     attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
-    integration:'EOD files land in ADLS Gen2, Azure Function Blob Trigger detects arrival, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions, Data Factory, ADLS Gen2',
-    triggerType:'Event-driven (Blob Trigger on file arrival)',
+    integration:'Azure Functions timer trigger polls HubWise API regularly, retrieves new activities, converts to Parquet, sends to Validation & Reconciliation for quality checks. Watermark metadata table tracks last processed timestamp. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions (timer trigger), Azure API Management (HubWise API gateway), ADLS Gen2, Azure SQL (watermark tracking)',
+    triggerType:'Scheduled incremental (Azure Functions timer trigger at regular intervals, API polling for new activities)',
     eg:`{
   "_ingestion_date": "2024-01-15",
   "_source": "hubwise",
@@ -223,10 +223,10 @@ const NODES = {
   },
   bronze_bw: {
     id:'bronze_bw', label:'Bronze BW', sub:'Raw Landing', icon:'🟠', layer:'bronze', azSvc:'fn',
-    desc:'Landing zone in ADLS Gen2 for BW pension data. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
+    desc:'Landing zone in ADLS Gen2 for BW pension incremental changes. API polling pattern captures only updated pension accounts. All data converted to Parquet format and stored immutable with data quality validation. DQ findings logged to metadata table with automated alerts. No data rejected, all stored for audit trail and investigation. 7-year retention for FCA compliance.',
     attrs:['_ingestion_date','_source','_file_name','_row_hash','_vr_status','all_source_columns'],
-    integration:'CSV files land in ADLS Gen2, Azure Function Blob Trigger detects arrival, converts to Parquet, sends to Validation & Reconciliation for quality checks. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions, Data Factory, ADLS Gen2',
-    triggerType:'Event-driven (Blob Trigger on file arrival)',
+    integration:'Azure Functions timer trigger polls BW API at regular intervals, retrieves changed pension accounts, converts to Parquet, sends to Validation & Reconciliation for quality checks. Watermark metadata table tracks last processed timestamp. All data stored regardless of DQ outcome. Validated data proceeds to Silver processing.\n\nAzure Services: Azure Functions (timer trigger), Azure API Management (BW API gateway), ADLS Gen2, Azure SQL (watermark tracking)',
+    triggerType:'Scheduled incremental (Azure Functions timer trigger at regular intervals, API polling for changes)',
     eg:`{
   "_ingestion_date": "2024-01-15",
   "_source": "bw_pensions",
